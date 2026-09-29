@@ -1,0 +1,1 @@
+{"dependencies":{"heic-convert":"^2.1.0","pg":"^8.13.1","tesseract.js":"^5.1.1"},"description":"Family grocery receipt tracker — photo upload, OCR reading, shared monthly budget","engines":{"node":">=18"},"main":"server.js","name":"grocery-receipt-tracker","scripts":{"start":"node server.js","test":"node --test test/test.js"},"version":"1.0.0"}
