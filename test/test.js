@@ -5,7 +5,7 @@
  * line-parsing heuristics, auth flows, month boundaries, and the
  * multipart upload parser.
  */
-const { describe, it, before } = require('node:test');
+const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
@@ -588,5 +588,215 @@ describe('monthly collection + member shares (JSON store)', () => {
     assert.equal(b.collection, 80);
     assert.equal(summary.isLowBalance(summary.memberShare(80, 2)), true);
     assert.equal(summary.isLowBalance(summary.memberShare(500, 5)), false);
+  });
+});
+
+// ------------------------------------------------- firebase phone auth ----
+const firebaseAuth = require('../firebase-auth');
+const crypto2 = require('crypto');
+
+describe('firebase token verifier (no network)', () => {
+  const { publicKey, privateKey } = crypto2.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const { privateKey: otherKey } = crypto2.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const pubPem = publicKey.export({ type: 'spki', format: 'pem' });
+  const PROJECT = 'test-project-123';
+  let savedProjectId;
+
+  const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const nowSec = () => Math.floor(Date.now() / 1000);
+  function makeToken({ kid = 'testkid', payload, key = privateKey, alg = 'RS256' } = {}) {
+    const header = b64url(JSON.stringify({ alg, kid, typ: 'JWT' }));
+    const body = b64url(JSON.stringify(payload));
+    const sig = crypto2.sign('RSA-SHA256', Buffer.from(header + '.' + body), key);
+    return header + '.' + body + '.' + b64url(sig);
+  }
+  const basePayload = () => ({
+    aud: PROJECT,
+    iss: 'https://securetoken.google.com/' + PROJECT,
+    sub: 'firebase-uid-1',
+    phone_number: '+15551234567',
+    iat: nowSec() - 60,
+    exp: nowSec() + 3600,
+  });
+  const fetchImpl = async () => ({
+    ok: true,
+    json: async () => ({ testkid: pubPem }),
+    headers: { get: () => 'public, max-age=3600' },
+  });
+
+  before(() => {
+    savedProjectId = process.env.FIREBASE_PROJECT_ID;
+    process.env.FIREBASE_PROJECT_ID = PROJECT;
+    firebaseAuth._resetCertCache();
+  });
+  after(() => {
+    if (savedProjectId === undefined) delete process.env.FIREBASE_PROJECT_ID;
+    else process.env.FIREBASE_PROJECT_ID = savedProjectId;
+    firebaseAuth._resetCertCache();
+  });
+
+  it('accepts a valid token and returns uid + phone', async () => {
+    const tok = makeToken({ payload: basePayload() });
+    const out = await firebaseAuth.verifyIdToken(tok, { fetchImpl });
+    assert.equal(out.uid, 'firebase-uid-1');
+    assert.equal(out.phone, '+15551234567');
+  });
+
+  it('rejects a token with the wrong audience', async () => {
+    const tok = makeToken({ payload: { ...basePayload(), aud: 'other-project' } });
+    await assert.rejects(firebaseAuth.verifyIdToken(tok, { fetchImpl }), /bad-audience/);
+  });
+
+  it('rejects a token with the wrong issuer', async () => {
+    const tok = makeToken({ payload: { ...basePayload(), iss: 'https://securetoken.google.com/other' } });
+    await assert.rejects(firebaseAuth.verifyIdToken(tok, { fetchImpl }), /bad-issuer/);
+  });
+
+  it('rejects an expired token', async () => {
+    const tok = makeToken({ payload: { ...basePayload(), exp: nowSec() - 10 } });
+    await assert.rejects(firebaseAuth.verifyIdToken(tok, { fetchImpl }), /token-expired/);
+  });
+
+  it('rejects a token with a bad signature', async () => {
+    const tok = makeToken({ payload: basePayload(), key: otherKey });
+    await assert.rejects(firebaseAuth.verifyIdToken(tok, { fetchImpl }), /bad-signature/);
+  });
+
+  it('rejects a token whose kid is unknown', async () => {
+    const tok = makeToken({ kid: 'nosuchkid', payload: basePayload() });
+    await assert.rejects(firebaseAuth.verifyIdToken(tok, { fetchImpl }), /unknown-kid/);
+  });
+
+  it('rejects malformed tokens', async () => {
+    await assert.rejects(firebaseAuth.verifyIdToken('not-a-jwt', { fetchImpl }), /bad-token-format/);
+    await assert.rejects(firebaseAuth.verifyIdToken('a.b', { fetchImpl }), /bad-token-format/);
+  });
+
+  it('fails closed when FIREBASE_PROJECT_ID is missing', async () => {
+    delete process.env.FIREBASE_PROJECT_ID;
+    const tok = makeToken({ payload: basePayload() });
+    await assert.rejects(firebaseAuth.verifyIdToken(tok, { fetchImpl }), /firebase-not-configured/);
+    process.env.FIREBASE_PROJECT_ID = PROJECT;
+  });
+});
+
+describe('phone number normalization', () => {
+  it('normalizes US formats to E.164', () => {
+    assert.equal(firebaseAuth.normalizePhone('+1 (555) 123-4567'), '+15551234567');
+    assert.equal(firebaseAuth.normalizePhone('5551234567'), '+15551234567');
+    assert.equal(firebaseAuth.normalizePhone('15551234567'), '+15551234567');
+  });
+  it('keeps other countries as-is when already E.164', () => {
+    assert.equal(firebaseAuth.normalizePhone('+442071234567'), '+442071234567');
+  });
+  it('returns null for junk', () => {
+    assert.equal(firebaseAuth.normalizePhone('abc'), null);
+    assert.equal(firebaseAuth.normalizePhone(''), null);
+    assert.equal(firebaseAuth.normalizePhone('123'), null);
+  });
+});
+
+describe('phone login flow (JSON store)', () => {
+  let store;
+  let tmp;
+  const goodVerify = async (tok) => {
+    if (tok === 'good-token') return { uid: 'fb-uid-9', phone: '+15559876543' };
+    if (tok === 'nophone-token') return { uid: 'fb-uid-10', phone: null };
+    throw new Error('bad-token');
+  };
+
+  before(async () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'grt-phone-'));
+    store = require('../store');
+    store.setDataDir(tmp);
+    await store.init();
+  });
+
+  it('a brand-new phone number is asked for a display name first', async () => {
+    const out = await firebaseAuth.phoneLoginFlow({ store, idToken: 'good-token', verify: goodVerify });
+    assert.equal(out.ok, false);
+    assert.equal(out.code, 'needs-name');
+  });
+
+  it('a first login with a name creates a verified phone member', async () => {
+    const out = await firebaseAuth.phoneLoginFlow({ store, idToken: 'good-token', name: '  Mina  ', verify: goodVerify });
+    assert.equal(out.ok, true);
+    assert.equal(out.isNew, true);
+    assert.equal(out.user.phone, '+15559876543');
+    assert.equal(out.user.phone_verified, true);
+    assert.equal(out.user.name, 'Mina');
+    assert.equal(out.user.role, 'member');
+    const found = await store.findUserByPhone('+15559876543');
+    assert.equal(found.id, out.user.id);
+  });
+
+  it('a returning phone number logs straight in', async () => {
+    const out = await firebaseAuth.phoneLoginFlow({ store, idToken: 'good-token', verify: goodVerify });
+    assert.equal(out.ok, true);
+    assert.equal(out.isNew, false);
+    assert.equal(out.user.phone, '+15559876543');
+  });
+
+  it('a bad token is rejected', async () => {
+    const out = await firebaseAuth.phoneLoginFlow({ store, idToken: 'bogus', verify: goodVerify });
+    assert.equal(out.ok, false);
+    assert.equal(out.code, 'invalid-token');
+  });
+
+  it('a token without a phone claim is rejected', async () => {
+    const out = await firebaseAuth.phoneLoginFlow({ store, idToken: 'nophone-token', name: 'X', verify: goodVerify });
+    assert.equal(out.ok, false);
+    assert.equal(out.code, 'no-phone');
+  });
+
+  it('the store rejects a second account on the same phone', async () => {
+    // Same username (username IS the phone for phone members).
+    await assert.rejects(
+      store.createUser({ username: '+15559876543', phone: '+15559876543', phoneVerified: true, name: 'Dup', role: 'member' }),
+      /username-taken/
+    );
+    // Different username, same phone number.
+    await assert.rejects(
+      store.createUser({ username: 'someone-else', phone: '+15559876543', phoneVerified: true, name: 'Dup', role: 'member' }),
+      /phone-taken/
+    );
+  });
+
+  it('first-login members can join a house with an invite code', async () => {
+    const house = await store.createHouse({ name: 'Test House', created_by: 'admin' });
+    const member = await store.findUserByPhone('+15559876543');
+    assert.equal(member.house_id, null);
+    await store.joinHouse(member.id, house.invite_code);
+    const after = await store.getUserById(member.id);
+    assert.equal(after.house_id, house.id);
+  });
+});
+
+describe('phone login page (views)', () => {
+  const views = require('../views');
+
+  it('renders the Firebase phone flow when configured', () => {
+    const h = views.phoneLoginPage({ apiKey: 'a', authDomain: 'b', projectId: 'c' });
+    assert.match(h, /firebase-auth-compat\.js/);
+    assert.match(h, /Text me a code/);
+    assert.match(h, /\/auth\/phone\/session/);
+    assert.match(h, /RecaptchaVerifier/);
+    assert.match(h, /login\/password/);
+  });
+
+  it('shows a graceful notice when Firebase is not configured', () => {
+    const h = views.phoneLoginPage({ apiKey: '', authDomain: '', projectId: '' });
+    assert.match(h, /Phone login/);
+    assert.match(h, /set up on this server yet/);
+    assert.doesNotMatch(h, /firebase-auth-compat\.js/);
+  });
+
+  it('every page carries the PWA home-screen tags', () => {
+    const h = views.layout('T', '<p>x</p>', null);
+    assert.match(h, /rel="manifest" href="\/manifest\.json"/);
+    assert.match(h, /apple-touch-icon/);
+    assert.match(h, /apple-mobile-web-app-capable/);
+    assert.match(h, /apple-mobile-web-app-title/);
+    assert.match(h, /theme-color/);
   });
 });

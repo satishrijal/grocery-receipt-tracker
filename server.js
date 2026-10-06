@@ -16,6 +16,7 @@ const summary = require('./summary');
 const views = require('./views');
 const heic = require('./heic');
 const email = require('./email');
+const firebaseAuth = require('./firebase-auth');
 const { parseMultipart } = require('./multipart');
 
 const PORT = process.env.PORT || 3000;
@@ -101,6 +102,34 @@ function sendHtml(res, html, status = 200) {
   res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(html);
 }
+function sendJson(res, obj, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+/** Small JSON body reader for the phone-auth session endpoint. */
+function readJson(req, maxBytes = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) {
+        reject(new Error('body-too-large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('error', reject);
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch {
+        reject(new Error('bad-json'));
+      }
+    });
+  });
+}
 function redirect(res, to) {
   res.writeHead(302, { Location: to });
   res.end();
@@ -127,6 +156,7 @@ async function getUser(req) {
     id: m.id, username: m.username, role: m.role,
     name: m.name || null, email: m.email || null,
     email_verified: m.email_verified, house_id: m.house_id || null,
+    phone: m.phone || null,
   };
 }
 
@@ -177,7 +207,7 @@ async function checkLowBalance(userId, month) {
   }
 }
 
-const CONTENT_TYPES = { '.css': 'text/css', '.js': 'application/javascript', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif', '.heic': 'image/heic', '.heif': 'image/heif' };
+const CONTENT_TYPES = { '.css': 'text/css', '.js': 'application/javascript', '.json': 'application/manifest+json', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif', '.heic': 'image/heic', '.heif': 'image/heif' };
 
 /** Re-render the current month's dashboard with a budget form error. */
 async function sendBudgetError(res, user, isAdmin, message) {
@@ -217,8 +247,8 @@ async function handle(req, res) {
   const pathname = url.pathname;
   const method = req.method;
 
-  // Static assets (no auth needed for css/js; photos need auth — checked below)
-  if (method === 'GET' && (pathname === '/style.css' || pathname === '/app.js')) {
+  // Static assets (no auth needed for css/js/manifest/icons; photos need auth — checked below)
+  if (method === 'GET' && (pathname === '/style.css' || pathname === '/app.js' || pathname === '/manifest.json' || pathname.startsWith('/icons/'))) {
     return serveStatic(req, res, pathname);
   }
 
@@ -228,35 +258,69 @@ async function handle(req, res) {
   if (pathname === '/' ) return redirect(res, user ? '/app' : '/login');
 
   // ---- login / logout ----
-  if (pathname === '/login') {
+  // v3: the member path is Firebase phone auth. The password form stays for
+  // the admin and for older (pre-phone) member accounts.
+  async function passwordLogin(req, res) {
+    const form = await readUrlEncoded(req);
+    const username = (form.get('username') || '').trim();
+    const password = form.get('password') || '';
+    let login = null;
+    if (username === ADMIN_USER && password === ADMIN_PASS) {
+      login = { user_id: 'admin', username: ADMIN_USER, role: 'admin' };
+    } else {
+      const member = await store.findUserByUsername(username);
+      if (member && auth.verifyPassword(password, member.passHash)) {
+        // Email verification gate: unverified self-signups cannot log in.
+        if (!auth.loginAllowed(member)) {
+          return sendHtml(res, views.loginPage(
+            'Please verify your email first — check your Gmail for the verification link.',
+            { showResend: true, resendEmail: member.email || username }
+          ), 403);
+        }
+        login = { user_id: member.id, username: member.username, role: 'member' };
+      }
+    }
+    if (!login) return sendHtml(res, views.loginPage('Wrong username or password.'), 401);
+    const sid = auth.newSessionId();
+    await store.createSession({ id: sid, ...login });
+    setSessionCookie(res, sid);
+    return redirect(res, '/app');
+  }
+  if (pathname === '/login' && method === 'GET') {
+    if (user) return redirect(res, '/app');
+    return sendHtml(res, views.phoneLoginPage(firebaseAuth.firebaseClientConfig()));
+  }
+  // Phone session: the browser posts the Firebase ID token after the SMS
+  // code is confirmed. We verify it server-side, then create our session.
+  if (pathname === '/auth/phone/session' && method === 'POST') {
+    if (!firebaseAuth.firebaseConfigured()) {
+      return sendJson(res, { ok: false, code: 'not-configured' }, 503);
+    }
+    let body;
+    try {
+      body = await readJson(req);
+    } catch {
+      return sendJson(res, { ok: false, code: 'bad-request' }, 400);
+    }
+    const flow = await firebaseAuth.phoneLoginFlow({ store, idToken: body.idToken, name: body.name });
+    if (!flow.ok) {
+      // needs-name is a normal step (first login), not an error.
+      return sendJson(res, flow, flow.code === 'needs-name' ? 200 : 401);
+    }
+    const sid = auth.newSessionId();
+    await store.createSession({ id: sid, user_id: flow.user.id, username: flow.user.username, role: 'member' });
+    setSessionCookie(res, sid);
+    return sendJson(res, { ok: true, isNew: flow.isNew, redirect: '/app' });
+  }
+  if (pathname === '/login/password') {
     if (user) return redirect(res, '/app');
     if (method === 'GET') return sendHtml(res, views.loginPage(''));
-    if (method === 'POST') {
-      const form = await readUrlEncoded(req);
-      const username = (form.get('username') || '').trim();
-      const password = form.get('password') || '';
-      let login = null;
-      if (username === ADMIN_USER && password === ADMIN_PASS) {
-        login = { user_id: 'admin', username: ADMIN_USER, role: 'admin' };
-      } else {
-        const member = await store.findUserByUsername(username);
-        if (member && auth.verifyPassword(password, member.passHash)) {
-          // Email verification gate: unverified self-signups cannot log in.
-          if (!auth.loginAllowed(member)) {
-            return sendHtml(res, views.loginPage(
-              'Please verify your email first — check your Gmail for the verification link.',
-              { showResend: true, resendEmail: member.email || username }
-            ), 403);
-          }
-          login = { user_id: member.id, username: member.username, role: 'member' };
-        }
-      }
-      if (!login) return sendHtml(res, views.loginPage('Wrong username or password.'), 401);
-      const sid = auth.newSessionId();
-      await store.createSession({ id: sid, ...login });
-      setSessionCookie(res, sid);
-      return redirect(res, '/app');
-    }
+    if (method === 'POST') return passwordLogin(req, res);
+  }
+  // Back-compat: anything still POSTing to /login gets the password flow.
+  if (pathname === '/login' && method === 'POST') {
+    if (user) return redirect(res, '/app');
+    return passwordLogin(req, res);
   }
   if (pathname === '/logout' && method === 'POST') {
     const sid = parseCookies(req).sid;

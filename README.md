@@ -1,19 +1,37 @@
-# 🧾 Grocery Receipt Tracker — now a household finance app (v2)
+# 🧾 Home Finance (v3) — was Grocery Receipt Tracker
 
-Family grocery budget app, upgraded: everyone **signs up themselves with
-their Gmail** (email verification required), joins a **house** with an invite
+Family home-finance app: everyone **logs in with their phone number** (a code
+is texted to them — no password needed), joins a **house** with an invite
 code, and gets an equal **share of the monthly collection** (e.g. $500 ÷ 5 =
 $100 each). Snap a photo of each grocery receipt — the app reads the items,
 you review and fix them, and your dashboard shows **your** share, spending,
-and remaining. Drop **below $50** and you get a low-money alert (in the app
-plus one email per month) with an **add-money** button to top up your share.
+and remaining. Drop **below $50** and you get a low-money alert (in the app,
+plus one email per month if email is set up) with an **add-money** button to
+top up your share.
+
+**iPhone install:** deploy, then on your iPhone open the URL in Safari →
+Share → **Add to Home Screen**. It installs as "Home Finance" with its own
+app icon, opening fullscreen like a real app — free, no App Store.
 
 iPhone photos work as-is: **HEIC pictures are converted to JPEG automatically**
 before the app reads them.
 
 No terminal needed for any of this — everything below is done in the browser.
 
-## What's new in v2
+## What's new in v3
+
+- **Phone login (Firebase Phone Auth)**: members type their phone number,
+  get a texted code, done. 10,000 free verifications/month. See
+  **FIREBASE_SETUP.md** for the 5-minute setup. The admin password login and
+  older accounts keep working; the Gmail signup pages still exist but are no
+  longer the member path.
+- **App icon + home-screen install**: new "Home Finance" icon, web manifest,
+  and iOS meta tags — Add to Home Screen from Safari.
+- Everything else from v2 is unchanged: houses + invite codes, monthly
+  collection split per member, per-member top-ups, receipt AI, low-balance
+  alerts.
+
+## What v2 added (kept in v3)
 
 - **Self-signup with Gmail**: name + Gmail address + password (min 8 chars).
   A verification link is emailed — **login is blocked until it's clicked**.

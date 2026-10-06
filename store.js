@@ -198,7 +198,7 @@ const jsonBackend = {
     const legacy = Number(db.settings.budget);
     return legacy > 0 ? legacy : 500;
   },
-  async createUser({ username, passHash, role, email, name, emailVerified, verificationToken, verificationExpires }) {
+  async createUser({ username, passHash, role, email, name, emailVerified, verificationToken, verificationExpires, phone, phoneVerified }) {
     const db = loadCache();
     if (db.users.some((u) => u.username.toLowerCase() === username.toLowerCase())) {
       throw new Error('username-taken');
@@ -207,6 +207,10 @@ const jsonBackend = {
     if (cleanEmail && db.users.some((u) => u.email && u.email.toLowerCase() === cleanEmail)) {
       throw new Error('email-taken');
     }
+    const cleanPhone = phone ? String(phone).trim() : null;
+    if (cleanPhone && db.users.some((u) => u.phone === cleanPhone)) {
+      throw new Error('phone-taken');
+    }
     const user = {
       id: nextId('user'), username, passHash, role: role || 'member',
       email: cleanEmail, name: name ? String(name).trim().slice(0, 40) : null,
@@ -214,6 +218,9 @@ const jsonBackend = {
       email_verified: emailVerified === undefined ? undefined : !!emailVerified,
       verification_token: verificationToken || null,
       verification_expires: verificationExpires || null,
+      // v3: Firebase phone login. phone_verified is true — Firebase verified it.
+      phone: cleanPhone,
+      phone_verified: phoneVerified === undefined ? undefined : !!phoneVerified,
       house_id: null,
       created_at: new Date().toISOString(),
     };
@@ -230,6 +237,12 @@ const jsonBackend = {
   async findUserByEmail(email) {
     const clean = String(email || '').trim().toLowerCase();
     return loadCache().users.find((u) => u.email && u.email.toLowerCase() === clean) || null;
+  },
+  /** v3: Firebase phone login keys users by their E.164 phone number. */
+  async findUserByPhone(phone) {
+    const clean = String(phone || '').trim();
+    if (!clean) return null;
+    return loadCache().users.find((u) => u.phone === clean) || null;
   },
   /** Finds by token only while it hasn't expired; expired tokens return null. */
   async findUserByVerificationToken(token) {
@@ -322,6 +335,7 @@ const jsonBackend = {
       .map((u) => ({
         id: u.id, username: u.username, name: u.name, email: u.email,
         role: u.role, email_verified: u.email_verified, house_id: u.house_id,
+        phone: u.phone || null, phone_verified: u.phone_verified,
         created_at: u.created_at,
       }));
   },
@@ -330,6 +344,7 @@ const jsonBackend = {
       id: u.id, username: u.username, role: u.role, created_at: u.created_at,
       email: u.email || null, name: u.name || null,
       email_verified: u.email_verified, house_id: u.house_id || null,
+      phone: u.phone || null, phone_verified: u.phone_verified,
     }));
   },
   async setUserPassword(id, passHash) {
@@ -420,6 +435,7 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (LOWER(username));
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users (LOWER(email));
 -- v2 columns (idempotent so old databases upgrade in place)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT;
@@ -427,6 +443,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_expires TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS house_id TEXT;
+-- v3 columns: Firebase phone login (idempotent so old databases upgrade in place)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN;
 CREATE TABLE IF NOT EXISTS houses (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -480,6 +499,8 @@ const mapUser = (r) => ({
   email_verified: r.email_verified === undefined ? undefined : r.email_verified,
   verification_token: r.verification_token || null,
   verification_expires: r.verification_expires || null,
+  phone: r.phone || null,
+  phone_verified: r.phone_verified === undefined ? undefined : r.phone_verified,
   house_id: r.house_id || null,
   created_at: r.created_at,
 });
@@ -563,19 +584,21 @@ const pgBackend = {
     const legacy = await pgBackend.getBudget();
     return legacy > 0 ? legacy : 500;
   },
-  async createUser({ username, passHash, role, email, name, emailVerified, verificationToken, verificationExpires }) {
+  async createUser({ username, passHash, role, email, name, emailVerified, verificationToken, verificationExpires, phone, phoneVerified }) {
     const cleanEmail = email ? String(email).trim().toLowerCase() : null;
+    const cleanPhone = phone ? String(phone).trim() : null;
     try {
       const r = await q(
-        'INSERT INTO users(username, pass_hash, role, email, name, email_verified, verification_token, verification_expires) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, username, role',
+        'INSERT INTO users(username, pass_hash, role, email, name, email_verified, verification_token, verification_expires, phone, phone_verified) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id, username, role',
         [username, passHash, role || 'member', cleanEmail, name ? String(name).trim().slice(0, 40) : null,
           emailVerified === undefined ? null : !!emailVerified, verificationToken || null,
-          verificationExpires ? new Date(verificationExpires) : null]
+          verificationExpires ? new Date(verificationExpires) : null,
+          cleanPhone, phoneVerified === undefined ? null : !!phoneVerified]
       );
       return { id: String(r.rows[0].id), username: r.rows[0].username, role: r.rows[0].role };
     } catch (e) {
       if (e.code === '23505') {
-        // Could be username or email uniqueness — report generically; the
+        // Could be username, email, or phone uniqueness — report generically; the
         // server checks each field first for a precise message.
         throw new Error('username-taken');
       }
@@ -583,26 +606,34 @@ const pgBackend = {
     }
   },
   async findUserByUsername(username) {
-    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, house_id, created_at FROM users WHERE LOWER(username)=LOWER($1)', [username]);
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, phone, phone_verified, house_id, created_at FROM users WHERE LOWER(username)=LOWER($1)', [username]);
     if (!r.rows.length) return null;
     const u = r.rows[0];
     return { ...mapUser(u), passHash: u.passHash };
   },
   async getUserById(id) {
-    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, house_id, created_at FROM users WHERE id=$1', [Number(id)]);
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, phone, phone_verified, house_id, created_at FROM users WHERE id=$1', [Number(id)]);
     if (!r.rows.length) return null;
     const u = r.rows[0];
     return { ...mapUser(u), passHash: u.passHash };
   },
   async findUserByEmail(email) {
-    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, house_id, created_at FROM users WHERE LOWER(email)=LOWER($1)', [String(email || '').trim().toLowerCase()]);
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, phone, phone_verified, house_id, created_at FROM users WHERE LOWER(email)=LOWER($1)', [String(email || '').trim().toLowerCase()]);
+    if (!r.rows.length) return null;
+    const u = r.rows[0];
+    return { ...mapUser(u), passHash: u.passHash };
+  },
+  async findUserByPhone(phone) {
+    const clean = String(phone || '').trim();
+    if (!clean) return null;
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, phone, phone_verified, house_id, created_at FROM users WHERE phone=$1', [clean]);
     if (!r.rows.length) return null;
     const u = r.rows[0];
     return { ...mapUser(u), passHash: u.passHash };
   },
   async findUserByVerificationToken(token) {
     if (!token) return null;
-    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, house_id, created_at FROM users WHERE verification_token=$1 AND verification_expires > now()', [String(token)]);
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, phone, phone_verified, house_id, created_at FROM users WHERE verification_token=$1 AND verification_expires > now()', [String(token)]);
     if (!r.rows.length) return null;
     const u = r.rows[0];
     return { ...mapUser(u), passHash: u.passHash };
@@ -765,12 +796,14 @@ async function maybeMigrate() {
   const userMap = {};
   for (const u of data.users || []) {
     const r = await q(
-      'INSERT INTO users(username, pass_hash, role, email, name, email_verified, verification_token, verification_expires, house_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id',
+      'INSERT INTO users(username, pass_hash, role, email, name, email_verified, verification_token, verification_expires, house_id, phone, phone_verified) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id',
       [u.username, u.passHash, u.role || 'member', u.email || null, u.name || null,
         u.email_verified === undefined ? null : !!u.email_verified,
         u.verification_token || null,
         u.verification_expires ? new Date(u.verification_expires) : null,
-        u.house_id || null]
+        u.house_id || null,
+        u.phone || null,
+        u.phone_verified === undefined ? null : !!u.phone_verified]
     );
     userMap[String(u.id)] = r.rows[0].id;
   }
@@ -855,6 +888,7 @@ module.exports = {
   findUserByUsername: (...a) => use().findUserByUsername(...a),
   getUserById: (...a) => use().getUserById(...a),
   findUserByEmail: (...a) => use().findUserByEmail(...a),
+  findUserByPhone: (...a) => use().findUserByPhone(...a),
   findUserByVerificationToken: (...a) => use().findUserByVerificationToken(...a),
   setVerificationToken: (...a) => use().setVerificationToken(...a),
   verifyUser: (...a) => use().verifyUser(...a),

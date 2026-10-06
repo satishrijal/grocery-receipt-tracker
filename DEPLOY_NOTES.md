@@ -1,55 +1,61 @@
-# Deploy notes — v2 (household finance upgrade)
+# Deploy notes — v3 (Firebase phone login + app icon + home-screen install)
 
-You already have the v1 app repo + Render service (or the v1 zip). This is an
-**update, not a new service**. All from your iPhone browser, no terminal.
+This is an **update to your existing Render service**, not a new one. All
+from your iPhone browser, no terminal.
 
-## What you're uploading
+## What v3 changes
 
-The v2 source (this folder). It adds: Gmail self-signup + email verification,
-houses with invite codes, monthly collection split per member, per-member
-top-ups, and low-balance (< $50) alerts. Old admin-created logins, receipts,
-and budgets carry over untouched.
+- **Member login is now phone number + texted code** (Firebase Phone Auth,
+  10,000 free verifications/month). The Gmail signup + email verification
+  pages still exist but are no longer the member path.
+- **Admin login (`ADMIN_USER` / `ADMIN_PASS`) is unchanged.** Old
+  admin-created and email member logins keep working; their receipts, houses,
+  and budgets carry over untouched.
+- **New app icon + iPhone home-screen support**: deploy, then on your iPhone
+  open the URL in Safari → Share → **Add to Home Screen**. It installs as
+  "Home Finance" with its own icon, opening fullscreen like a real app.
+- **Resend is now optional.** Low-balance alerts show in the app; the emails
+  only send if `RESEND_API_KEY` is still set.
 
 ## Steps (do these yourself — I can't touch your accounts)
 
-1. **GitHub** → open your existing `grocery-receipt-tracker` repo → *Add file →
-   Upload files* → drag in ALL files from this v2 folder (server.js, email.js,
-   store.js, auth.js, views.js, summary.js, parser.js, heic.js, multipart.js,
-   package.json, package-lock.json, public/, test/, README.md,
-   DEPLOY_NOTES.md). **Skip `node_modules`** and **skip `data/`**. Commit.
+1. **GitHub** → your existing `grocery-receipt-tracker` repo → *Add file →
+   Upload files* → drag in ALL files from this v3 folder (server.js,
+   store.js, auth.js, firebase-auth.js, email.js, views.js, summary.js,
+   parser.js, heic.js, multipart.js, package.json, package-lock.json,
+   public/, test/, README.md, DEPLOY_NOTES.md, FIREBASE_SETUP.md).
+   **Skip `node_modules`** and **skip `data/`**. Commit.
    Render will auto-redeploy (a minute or two).
 
-2. **Resend (free)** — needed for the verification + low-balance emails:
-   - resend.com → sign up free (100 emails/day, no card).
-   - *API Keys* → create one → copy it.
-   - Render → your service → *Environment* → add `RESEND_API_KEY` = the key.
-   - Optional: add `FROM_EMAIL` = an address on a domain you verified in
-     Resend. If you skip this, emails come from `onboarding@resend.dev`,
-     which Resend only delivers to your own address — fine for testing,
-     verify a domain before the whole family signs up.
+2. **Firebase (free)** — follow **FIREBASE_SETUP.md** in this folder:
+   create the project, enable Phone sign-in, copy the three keys, add
+   `FIREBASE_API_KEY`, `FIREBASE_AUTH_DOMAIN`, `FIREBASE_PROJECT_ID` to
+   Render → Environment → Save, then add your `*.onrender.com` domain under
+   Firebase → Authentication → Settings → Authorized domains.
+   **Do this in parallel — nothing else waits on it.**
 
-3. **ADMIN_USER / ADMIN_PASS** — unchanged, leave them as they are.
+3. **ADMIN_USER / ADMIN_PASS / DATABASE_URL** — unchanged, leave them.
 
-4. **DATABASE_URL** — unchanged. If v1 ran on the JSON file, v2 keeps using
-   it; if you added Postgres, the new tables/columns are created
-   automatically on first boot and your data migrates as before.
-
-## If you skip step 2
-
-The app still runs. New signups will see "email isn't set up yet — ask the
-admin", and the Admin page shows each unverified member's verification link
-plus a **Verify by hand** button. Low-balance alerts still show in the app;
-the emails just won't send until you add the key.
+4. **Resend** — optional now. Leave `RESEND_API_KEY` if you want the
+   low-balance emails too; remove it if not. The app runs fine either way.
 
 ## After deploy
 
-1. Log in as admin → **Admin** → create a **house** → copy the invite code.
-2. Set the **monthly collection** (default $500).
-3. Family: open the app → **Sign up with your Gmail** → click the email link →
-   log in → **Join your house** with the invite code.
-4. Everyone snaps receipts as before — spending is now tracked per member.
+1. Log in as admin → **Admin** → create a **house** (if you haven't) → copy
+   the invite code. Set the **monthly collection**.
+2. Family: open the app → **Log in 📱** → phone number → texted code →
+   (first time) enter name → **Join your house** with the invite code.
+3. iPhone home screen: Safari → Share → **Add to Home Screen**.
+
+## If you skip step 2 (Firebase)
+
+The app still boots and the admin login works, but the phone login page
+shows "Phone login isn't set up on this server yet" until the three keys
+are added. Nothing breaks.
 
 ## Rollback
 
-The v1 zip is untouched at `~/workspace/your_files/grocery-receipt-tracker.zip`.
-Re-upload those files to GitHub if you ever need to go back (data stays safe).
+The v1 and v2 zips are untouched
+(`~/workspace/your_files/grocery-receipt-tracker.zip`,
+`~/workspace/your_files/grocery-receipt-tracker-v2.zip`). Re-upload either
+to GitHub if you ever need to go back (data stays safe).
