@@ -15,6 +15,7 @@ const parser = require('./parser');
 const summary = require('./summary');
 const views = require('./views');
 const heic = require('./heic');
+const email = require('./email');
 const { parseMultipart } = require('./multipart');
 
 const PORT = process.env.PORT || 3000;
@@ -116,7 +117,64 @@ async function getUser(req) {
   if (!sid) return null;
   const s = await store.getSession(sid);
   if (!s) return null;
-  return { id: s.user_id, username: s.username, role: s.role };
+  if (s.role === 'admin') {
+    return { id: 'admin', username: s.username, role: 'admin', name: null, email: null, email_verified: true, house_id: null };
+  }
+  // Fresh member record so house membership / verification state is current.
+  const m = await store.getUserById(s.user_id).catch(() => null);
+  if (!m) return null;
+  return {
+    id: m.id, username: m.username, role: m.role,
+    name: m.name || null, email: m.email || null,
+    email_verified: m.email_verified, house_id: m.house_id || null,
+  };
+}
+
+/** Display name for a user (self-signup name, else the username). */
+function displayName(u) {
+  return (u && u.name) || (u && u.username) || '—';
+}
+
+/**
+ * After anything that changes a member's money (new receipt, top-up,
+ * collection change), check the low-balance threshold and send ONE email
+ * per member per month when they cross below $50.
+ */
+async function checkLowBalance(userId, month) {
+  try {
+    const member = await store.getUserById(userId);
+    if (!member || !member.house_id) return;
+    const mb = await store.getMonthBudget(month);
+    const members = await store.listHouseMembers(member.house_id);
+    const share = summary.memberShare(mb.collection, members.length);
+    const receipts = await store.listReceipts();
+    const spent = summary.round2(receipts
+      .filter((r) => summary.monthKeyOf(r.date) === month && String(r.uploaded_by) === String(userId))
+      .reduce((s, r) => s + (Number(r.total) || 0), 0));
+    const topups = summary.round2(mb.topups
+      .filter((t) => String(t.user_id) === String(userId))
+      .reduce((s, t) => s + (Number(t.amount) || 0), 0));
+    const remaining = summary.memberRemaining({ share, topups, spent });
+    if (!summary.isLowBalance(remaining)) return;
+    if (mb.lowBalanceNotified.map(String).includes(String(userId))) return; // already notified
+    let emailed = false;
+    if (member.email && email.emailConfigured()) {
+      const res = await email.sendEmail({
+        to: member.email,
+        subject: '⚠️ Your house money is low — add more money',
+        html: email.lowBalanceEmailHtml(displayName(member), remaining, email.baseUrl() + '/app'),
+      });
+      emailed = res.ok;
+      if (!res.ok) console.warn('[low-balance] email failed for', member.username, res.reason);
+    } else {
+      // No email on file or mail not configured: log once, don't spam.
+      console.log(`[low-balance] ${member.username} is below $50 (remaining $${remaining.toFixed(2)}) — no email sent (no address or RESEND_API_KEY not set).`);
+      emailed = true;
+    }
+    if (emailed) await store.markLowBalanceNotified(month, userId);
+  } catch (e) {
+    console.warn('[low-balance] check failed:', e.message);
+  }
 }
 
 const CONTENT_TYPES = { '.css': 'text/css', '.js': 'application/javascript', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif', '.heic': 'image/heic', '.heif': 'image/heif' };
@@ -183,6 +241,13 @@ async function handle(req, res) {
       } else {
         const member = await store.findUserByUsername(username);
         if (member && auth.verifyPassword(password, member.passHash)) {
+          // Email verification gate: unverified self-signups cannot log in.
+          if (!auth.loginAllowed(member)) {
+            return sendHtml(res, views.loginPage(
+              'Please verify your email first — check your Gmail for the verification link.',
+              { showResend: true, resendEmail: member.email || username }
+            ), 403);
+          }
           login = { user_id: member.id, username: member.username, role: 'member' };
         }
       }
@@ -200,6 +265,87 @@ async function handle(req, res) {
     return redirect(res, '/login');
   }
 
+  // ---- self-signup with Gmail + email verification ----
+  if (pathname === '/signup') {
+    if (user) return redirect(res, '/app');
+    if (method === 'GET') return sendHtml(res, views.signupPage('', {}));
+    if (method === 'POST') {
+      const form = await readUrlEncoded(req);
+      const name = (form.get('name') || '').trim();
+      const emailAddr = (form.get('email') || '').trim().toLowerCase();
+      const password = form.get('password') || '';
+      const confirm = form.get('confirm') || '';
+      const fail = (msg) => sendHtml(res, views.signupPage(msg, { name, email: emailAddr }), 400);
+      const validationError = auth.validateSignup({ name, email: emailAddr, password, confirm });
+      if (validationError) return fail(validationError);
+      if (await store.findUserByUsername(emailAddr)) return fail('That Gmail is already registered. Try logging in instead.');
+      if (await store.findUserByEmail(emailAddr)) return fail('That Gmail is already registered. Try logging in instead.');
+      const token = auth.newVerifyToken();
+      const expires = auth.verifyTokenExpiry();
+      try {
+        await store.createUser({
+          username: emailAddr, passHash: auth.hashPassword(password), role: 'member',
+          email: emailAddr, name, emailVerified: false,
+          verificationToken: token, verificationExpires: expires,
+        });
+      } catch (e) {
+        if (e.message === 'username-taken' || e.message === 'email-taken') {
+          return fail('That Gmail is already registered. Try logging in instead.');
+        }
+        throw e;
+      }
+      const link = email.buildVerifyLink(email.baseUrl(), token);
+      const sendRes = await email.sendEmail({
+        to: emailAddr,
+        subject: 'Verify your Grocery Tracker account',
+        html: email.verificationEmailHtml(name, link),
+      });
+      if (!sendRes.ok && sendRes.reason === 'not-configured') {
+        // Mail isn't set up yet: log the link so the admin can share it by hand.
+        console.log(`[signup] RESEND_API_KEY not set — verification link for ${emailAddr}: ${link}`);
+      }
+      return sendHtml(res, views.signupDonePage(emailAddr, sendRes.ok));
+    }
+  }
+
+  // ---- email verification link ----
+  if (pathname === '/verify' && method === 'GET') {
+    if (user) return redirect(res, '/app');
+    const token = url.searchParams.get('token') || '';
+    const member = await store.findUserByVerificationToken(token);
+    if (!member) {
+      return sendHtml(res, views.verifyResultPage(false, 'That link is invalid or has expired. Ask for a new one below.'), 400);
+    }
+    await store.verifyUser(member.id);
+    return sendHtml(res, views.verifyResultPage(true));
+  }
+
+  // ---- resend verification email ----
+  if (pathname === '/verify/resend') {
+    if (user) return redirect(res, '/app');
+    if (method === 'GET') return sendHtml(res, views.resendPage('', ''));
+    if (method === 'POST') {
+      const form = await readUrlEncoded(req);
+      const emailAddr = (form.get('email') || '').trim().toLowerCase();
+      // Same reply either way so addresses can't be probed.
+      const doneMsg = 'If an unverified account exists for that Gmail, a new link is on its way.';
+      const member = await store.findUserByEmail(emailAddr);
+      if (member && member.email_verified === false && member.verification_token) {
+        await store.setVerificationToken(member.id, member.verification_token, auth.verifyTokenExpiry());
+        const link = email.buildVerifyLink(email.baseUrl(), member.verification_token);
+        const sendRes = await email.sendEmail({
+          to: emailAddr,
+          subject: 'Verify your Grocery Tracker account',
+          html: email.verificationEmailHtml(member.name || member.username, link),
+        });
+        if (!sendRes.ok && sendRes.reason === 'not-configured') {
+          console.log(`[signup] RESEND_API_KEY not set — verification link for ${emailAddr}: ${link}`);
+        }
+      }
+      return sendHtml(res, views.resendPage('', doneMsg));
+    }
+  }
+
   if (!user) return redirect(res, '/login');
 
   // ---- receipt photos (auth required) ----
@@ -211,16 +357,113 @@ async function handle(req, res) {
   if (pathname === '/app' && method === 'GET') {
     let month = url.searchParams.get('month') || summary.currentMonthKey();
     if (!/^\d{4}-\d{2}$/.test(month)) month = summary.currentMonthKey();
-    const receipts = await store.listReceipts();
-    const itemsByReceipt = await store.getItemsForReceipts(receipts.map((r) => r.id));
+    return sendHtml(res, await buildDashboardPage(user, isAdmin, month, {}));
+  }
+
+  /** Shared dashboard builder so error paths re-render the same page. */
+  async function buildDashboardPage(user, isAdmin, month, extra = {}) {
+    const allReceipts = await store.listReceipts();
     const mb = await store.getMonthBudget(month);
-    const data = summary.summarizeMonth({
-      receipts, itemsByReceipt, budget: mb.total, month, base: mb.base, added: mb.added,
-    });
-    data.budgetPrompt = summary.needsBudgetPrompt({
+    const house = user.house_id ? await store.getHouse(user.house_id) : null;
+
+    let receipts = allReceipts;
+    let houseView = null;
+    let data;
+
+    if (house && !isAdmin) {
+      // House member: personal share math + only their own receipts.
+      const members = await store.listHouseMembers(house.id);
+      const myReceipts = allReceipts.filter((r) => String(r.uploaded_by) === String(user.id));
+      const itemsByReceipt = await store.getItemsForReceipts(myReceipts.map((r) => r.id));
+      const spent = summary.round2(myReceipts
+        .filter((r) => summary.monthKeyOf(r.date) === month)
+        .reduce((s, r) => s + (Number(r.total) || 0), 0));
+      const topups = summary.round2(mb.topups
+        .filter((t) => String(t.user_id) === String(user.id))
+        .reduce((s, t) => s + (Number(t.amount) || 0), 0));
+      const share = summary.memberShare(mb.collection, members.length);
+      const remaining = summary.memberRemaining({ share, topups, spent });
+      data = summary.summarizeMonth({
+        receipts: myReceipts, itemsByReceipt, budget: summary.round2(share + topups),
+        month, base: share, added: topups,
+      });
+      houseView = {
+        house, members, share, spent, topups, remaining,
+        collection: mb.collection,
+        collectionSet: mb.hasEntry,
+        lowBalance: summary.isLowBalance(remaining),
+      };
+      receipts = myReceipts;
+    } else {
+      // Admin or not in a house: classic shared-budget view (unchanged).
+      const itemsByReceipt = await store.getItemsForReceipts(allReceipts.map((r) => r.id));
+      data = summary.summarizeMonth({
+        receipts: allReceipts, itemsByReceipt, budget: mb.total, month, base: mb.base, added: mb.added,
+      });
+    }
+
+    data.budgetPrompt = (!house && summary.needsBudgetPrompt({
       month, currentMonth: summary.currentMonthKey(), hasEntry: mb.hasEntry,
-    }) ? { prefill: await store.getBudgetPrefill(month) } : null;
-    return sendHtml(res, views.dashboardPage({ user, isAdmin, month, data }));
+    })) ? { prefill: await store.getBudgetPrefill(month) } : null;
+
+    let adminHouses = null;
+    if (isAdmin) {
+      const houses = await store.listHouses();
+      adminHouses = [];
+      for (const h of houses) {
+        const members = await store.listHouseMembers(h.id);
+        const share = summary.memberShare(mb.collection, members.length);
+        const rows = members.map((m) => {
+          const spent = summary.round2(allReceipts
+            .filter((r) => summary.monthKeyOf(r.date) === month && String(r.uploaded_by) === String(m.id))
+            .reduce((s, r) => s + (Number(r.total) || 0), 0));
+          const topups = summary.round2(mb.topups
+            .filter((t) => String(t.user_id) === String(m.id))
+            .reduce((s, t) => s + (Number(t.amount) || 0), 0));
+          const remaining = summary.memberRemaining({ share, topups, spent });
+          return { ...m, share, spent, topups, remaining, low: summary.isLowBalance(remaining) };
+        });
+        adminHouses.push({ house: h, collection: mb.collection, members: rows });
+      }
+    }
+
+    return views.dashboardPage({ user, isAdmin, month, data, houseView, adminHouses, ...extra });
+  }
+
+  // ---- join / leave a house ----
+  if (pathname === '/house/join' && method === 'POST') {
+    const form = await readUrlEncoded(req);
+    const code = (form.get('code') || '').trim();
+    try {
+      await store.joinHouse(user.id, code);
+    } catch (e) {
+      const month = summary.currentMonthKey();
+      return sendHtml(res, await buildDashboardPage(user, isAdmin, month, {
+        joinError: e.message === 'bad-code' ? 'That invite code didn\u2019t match any house. Check it and try again.' : 'Could not join the house.',
+      }), 400);
+    }
+    return redirect(res, '/app');
+  }
+  if (pathname === '/house/leave' && method === 'POST') {
+    await store.leaveHouse(user.id).catch(() => {});
+    return redirect(res, '/app');
+  }
+
+  // ---- add money to my own share (house members) ----
+  if (pathname === '/topup/add' && method === 'POST') {
+    if (!user.house_id) {
+      res.writeHead(403);
+      return res.end('forbidden');
+    }
+    const form = await readUrlEncoded(req);
+    const amount = Math.round((parseFloat(form.get('amount')) || 0) * 100) / 100;
+    const month = summary.currentMonthKey();
+    if (!(amount > 0) || amount > 1000000) {
+      return sendHtml(res, await buildDashboardPage(user, isAdmin, month, { topupError: 'Enter a valid amount to add.' }), 400);
+    }
+    await store.addMemberTopup(month, user.id, displayName(user), amount);
+    await checkLowBalance(user.id, month);
+    return redirect(res, '/app');
   }
 
   // ---- set this month's starting budget (any logged-in user) ----
@@ -325,6 +568,7 @@ async function handle(req, res) {
       uploaded_by: user.id, uploaded_by_name: user.username, photo,
     });
     await store.addItems(receipt.id, items);
+    await checkLowBalance(user.id, date.slice(0, 7));
     return redirect(res, '/app?month=' + encodeURIComponent(date.slice(0, 7)));
   }
 
@@ -348,13 +592,33 @@ async function handle(req, res) {
   }
 
   // ---- admin ----
-  // The admin budget form edits the CURRENT month's starting (base) budget.
+  // The admin collection form edits the CURRENT month's monthly collection.
   // Money added mid-month via "Add money" is kept as separate entries.
   const curMonth = summary.currentMonthKey();
   async function adminCtx(extra = {}) {
     const members = await store.listUsers();
     const mb = await store.getMonthBudget(curMonth);
-    return { members, budget: mb.base, addedThisMonth: mb.added, monthLabel: summary.prettyMonth(curMonth), ...extra };
+    const houses = await store.listHouses();
+    const housesWithMembers = [];
+    for (const h of houses) {
+      housesWithMembers.push({ ...h, members: await store.listHouseMembers(h.id) });
+    }
+    const unverified = [];
+    for (const m of members.filter((mm) => mm.email && mm.email_verified === false)) {
+      const full = await store.findUserByEmail(m.email).catch(() => null);
+      unverified.push({
+        ...m,
+        verifyLink: full && full.verification_token ? email.buildVerifyLink(email.baseUrl(), full.verification_token) : null,
+      });
+    }
+    return {
+      members, budget: mb.base, collection: mb.collection,
+      addedThisMonth: mb.added, monthLabel: summary.prettyMonth(curMonth),
+      houses: housesWithMembers, unverified,
+      emailConfigured: email.emailConfigured(),
+      emailFrom: process.env.FROM_EMAIL || 'onboarding@resend.dev',
+      ...extra,
+    };
   }
   if (pathname === '/admin' && method === 'GET') {
     if (!isAdmin) {
@@ -363,18 +627,83 @@ async function handle(req, res) {
     }
     return sendHtml(res, views.adminPage(user, await adminCtx()));
   }
-  if (pathname === '/admin/budget' && method === 'POST') {
+  // Monthly collection (v2). /admin/budget is kept as an alias for old links.
+  async function handleCollection(form, user) {
+    const amount = Math.round((parseFloat(form.get('collection') || form.get('budget')) || 0) * 100) / 100;
+    if (!(amount > 0) || amount > 1000000) {
+      return { error: 'Enter a valid collection amount.' };
+    }
+    await store.setMonthCollection(curMonth, amount);
+    // Shares changed for everyone — re-check low balances across houses.
+    const houses = await store.listHouses();
+    for (const h of houses) {
+      for (const m of await store.listHouseMembers(h.id)) {
+        await checkLowBalance(m.id, curMonth);
+      }
+    }
+    return { msg: `Monthly collection set to $${amount.toFixed(2)} — each member's share updated.` };
+  }
+  if ((pathname === '/admin/collection' || pathname === '/admin/budget') && method === 'POST') {
     if (!isAdmin) {
       res.writeHead(403);
       return res.end('forbidden');
     }
     const form = await readUrlEncoded(req);
-    const budget = Math.round((parseFloat(form.get('budget')) || 0) * 100) / 100;
-    if (!(budget > 0) || budget > 1000000) {
-      return sendHtml(res, views.adminPage(user, await adminCtx({ error: 'Enter a valid budget amount.' })));
+    const { error, msg } = await handleCollection(form, user);
+    return sendHtml(res, views.adminPage(user, await adminCtx({ error, msg })));
+  }
+  // ---- admin: houses ----
+  if (pathname === '/admin/houses/create' && method === 'POST') {
+    if (!isAdmin) {
+      res.writeHead(403);
+      return res.end('forbidden');
     }
-    await store.setMonthBudgetBase(curMonth, budget);
-    return sendHtml(res, views.adminPage(user, await adminCtx({ msg: 'Budget updated.' })));
+    const form = await readUrlEncoded(req);
+    const name = (form.get('name') || '').trim();
+    if (!name) {
+      return sendHtml(res, views.adminPage(user, await adminCtx({ error: 'Give the house a name.' })));
+    }
+    try {
+      const house = await store.createHouse({ name, created_by: user.id });
+      return sendHtml(res, views.adminPage(user, await adminCtx({
+        msg: `House \u201C${house.name}\u201D created — invite code: ${house.invite_code}. Share it with the family.`,
+      })));
+    } catch (e) {
+      return sendHtml(res, views.adminPage(user, await adminCtx({ error: 'Could not create the house.' })));
+    }
+  }
+  const delHouseMatch = pathname.match(/^\/admin\/houses\/([^/]+)\/delete$/);
+  if (delHouseMatch && method === 'POST') {
+    if (!isAdmin) {
+      res.writeHead(403);
+      return res.end('forbidden');
+    }
+    await store.deleteHouse(delHouseMatch[1]);
+    return sendHtml(res, views.adminPage(user, await adminCtx({ msg: 'House deleted. Its members were unlinked (their receipts were kept).' })));
+  }
+  // ---- admin: verify a member by hand (escape hatch when email isn't set up) ----
+  const verifyMatch = pathname.match(/^\/admin\/members\/([^/]+)\/verify$/);
+  if (verifyMatch && method === 'POST') {
+    if (!isAdmin) {
+      res.writeHead(403);
+      return res.end('forbidden');
+    }
+    try {
+      await store.verifyUser(verifyMatch[1]);
+    } catch (e) {
+      return sendHtml(res, views.adminPage(user, await adminCtx({ error: 'Member not found.' })));
+    }
+    return sendHtml(res, views.adminPage(user, await adminCtx({ msg: 'Member verified — they can log in now.' })));
+  }
+  // ---- admin: remove a member from their house ----
+  const unhouseMatch = pathname.match(/^\/admin\/members\/([^/]+)\/unhouse$/);
+  if (unhouseMatch && method === 'POST') {
+    if (!isAdmin) {
+      res.writeHead(403);
+      return res.end('forbidden');
+    }
+    await store.setUserHouse(unhouseMatch[1], null).catch(() => {});
+    return sendHtml(res, views.adminPage(user, await adminCtx({ msg: 'Member removed from the house.' })));
   }
   if (pathname === '/admin/members/create' && method === 'POST') {
     if (!isAdmin) {

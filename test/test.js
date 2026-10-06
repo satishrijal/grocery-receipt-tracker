@@ -384,3 +384,209 @@ describe('monthly budgets (JSON store)', () => {
     assert.equal(out.added, 0);
   });
 });
+
+// ------------------------------------------------------- v2: signup -----
+describe('self-signup validation', () => {
+  it('rejects non-gmail addresses', () => {
+    assert.match(auth.validateSignup({ name: 'Ram', email: 'ram@yahoo.com', password: 'password123', confirm: 'password123' }), /Gmail/i);
+    assert.match(auth.validateSignup({ name: 'Ram', email: 'not-an-email', password: 'password123', confirm: 'password123' }), /Gmail/i);
+    assert.match(auth.validateSignup({ name: 'Ram', email: 'ram@gmail', password: 'password123', confirm: 'password123' }), /Gmail/i);
+  });
+
+  it('accepts gmail case-insensitively and with dots/plus', () => {
+    assert.equal(auth.validateSignup({ name: 'Ram', email: 'Ram.Prasad+home@GMAIL.com', password: 'password123', confirm: 'password123' }), null);
+  });
+
+  it('rejects short passwords and mismatched confirmation', () => {
+    assert.match(auth.validateSignup({ name: 'Ram', email: 'ram@gmail.com', password: 'short', confirm: 'short' }), /8 characters/);
+    assert.match(auth.validateSignup({ name: 'Ram', email: 'ram@gmail.com', password: 'password123', confirm: 'password124' }), /do not match/);
+  });
+
+  it('rejects a missing name', () => {
+    assert.match(auth.validateSignup({ name: '  ', email: 'ram@gmail.com', password: 'password123', confirm: 'password123' }), /name/i);
+  });
+
+  it('verification tokens are 64 hex chars', () => {
+    const t1 = auth.newVerifyToken();
+    const t2 = auth.newVerifyToken();
+    assert.match(t1, /^[0-9a-f]{64}$/);
+    assert.notEqual(t1, t2);
+  });
+
+  it('password hashes are never plaintext and verify correctly', () => {
+    const h = auth.hashPassword('mysecretpw');
+    assert.ok(!h.includes('mysecretpw'));
+    assert.ok(h.startsWith('scrypt$'));
+    assert.ok(auth.verifyPassword('mysecretpw', h));
+    assert.ok(!auth.verifyPassword('wrongpw', h));
+  });
+
+  it('login gate: unverified blocked, verified + legacy allowed', () => {
+    assert.equal(auth.loginAllowed(null), false);
+    assert.equal(auth.loginAllowed({ email_verified: false }), false); // explicit false blocks
+    assert.equal(auth.loginAllowed({ email_verified: true }), true);
+    assert.equal(auth.loginAllowed({ username: 'ram' }), true); // old account, no field
+    assert.equal(auth.loginAllowed({ email_verified: null }), true);
+  });
+});
+
+// ------------------------------------------- v2: houses + invite codes ---
+describe('houses + invite codes (JSON store)', () => {
+  const store = require('../store'); // same tmp-dir store
+
+  it('creates a house with a short unambiguous invite code', async () => {
+    const h = await store.createHouse({ name: 'Test Home', created_by: 'admin' });
+    assert.ok(h.id);
+    assert.match(h.invite_code, /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/);
+    const h2 = await store.createHouse({ name: 'Other Home', created_by: 'admin' });
+    assert.notEqual(h.invite_code, h2.invite_code);
+  });
+
+  it('joins with a code (case-insensitive), rejects bad codes', async () => {
+    const house = await store.createHouse({ name: 'Join Home', created_by: 'admin' });
+    await store.createUser({ username: 'v2ram', passHash: auth.hashPassword('password123'), role: 'member' });
+    const member = await store.findUserByUsername('v2ram');
+    const joined = await store.joinHouse(member.id, house.invite_code.toLowerCase());
+    assert.equal(joined.id, house.id);
+    const updated = await store.getUserById(member.id);
+    assert.equal(updated.house_id, house.id);
+    const members = await store.listHouseMembers(house.id);
+    assert.ok(members.some((m) => m.id === member.id));
+    await assert.rejects(store.joinHouse(member.id, 'NOPE00'), /bad-code/);
+  });
+
+  it('leaving clears the house; deleting a house unlinks members', async () => {
+    const house = await store.createHouse({ name: 'Leave Home', created_by: 'admin' });
+    await store.createUser({ username: 'v2sita', passHash: auth.hashPassword('password123'), role: 'member' });
+    const member = await store.findUserByUsername('v2sita');
+    await store.joinHouse(member.id, house.invite_code);
+    await store.leaveHouse(member.id);
+    assert.equal((await store.getUserById(member.id)).house_id, null);
+    await store.joinHouse(member.id, house.invite_code);
+    await store.deleteHouse(house.id);
+    assert.equal(await store.getHouse(house.id), null);
+    assert.equal((await store.getUserById(member.id)).house_id, null);
+  });
+});
+
+// --------------------------------------- v2: email verification (store) ---
+describe('email verification flow (JSON store)', () => {
+  const store = require('../store');
+
+  it('unverified user is found by a live token, expired tokens vanish', async () => {
+    const token = auth.newVerifyToken();
+    await store.createUser({
+      username: 'v2hari@gmail.com', passHash: auth.hashPassword('password123'), role: 'member',
+      email: 'v2hari@gmail.com', name: 'Hari', emailVerified: false,
+      verificationToken: token, verificationExpires: auth.verifyTokenExpiry(),
+    });
+    const found = await store.findUserByVerificationToken(token);
+    assert.ok(found);
+    assert.equal(found.username, 'v2hari@gmail.com');
+    assert.equal(auth.loginAllowed(found), false); // gate blocks until verified
+
+    // Expire it by hand.
+    await store.setVerificationToken(found.id, token, new Date(Date.now() - 1000).toISOString());
+    assert.equal(await store.findUserByVerificationToken(token), null);
+    assert.equal(await store.findUserByVerificationToken('nope'), null);
+  });
+
+  it('verifyUser flips the flag and clears the token', async () => {
+    const member = await store.findUserByEmail('v2hari@gmail.com');
+    await store.verifyUser(member.id);
+    const updated = await store.findUserByEmail('v2hari@gmail.com');
+    assert.equal(updated.email_verified, true);
+    assert.equal(updated.verification_token, null);
+    assert.equal(auth.loginAllowed(updated), true);
+  });
+
+  it('duplicate emails are rejected case-insensitively', async () => {
+    await assert.rejects(
+      store.createUser({
+        username: 'v2other@gmail.com', passHash: auth.hashPassword('password123'), role: 'member',
+        email: 'V2HARI@GMAIL.COM', name: 'Dup', emailVerified: false,
+        verificationToken: auth.newVerifyToken(), verificationExpires: auth.verifyTokenExpiry(),
+      }),
+      /email-taken/
+    );
+  });
+});
+
+// --------------------------------- v2: collection + shares + low balance ---
+describe('monthly collection + member shares (JSON store)', () => {
+  const store = require('../store');
+  const MONTH = '2026-12';
+
+  it('share math: $500 / 5 = $100, recalculates when members join', () => {
+    assert.equal(summary.memberShare(500, 5), 100);
+    assert.equal(summary.memberShare(500, 6), 83.33);
+    assert.equal(summary.memberShare(500, 0), 0);
+    assert.equal(summary.memberRemaining({ share: 100, topups: 20, spent: 75 }), 45);
+  });
+
+  it('low-balance threshold is strictly below $50', () => {
+    assert.equal(summary.isLowBalance(49.99), true);
+    assert.equal(summary.isLowBalance(0), true);
+    assert.equal(summary.isLowBalance(50), false);
+    assert.equal(summary.isLowBalance(120), false);
+    assert.equal(summary.LOW_BALANCE_THRESHOLD, 50);
+  });
+
+  it('setMonthCollection keeps base in sync; getMonthBudget exposes collection', async () => {
+    await store.setMonthCollection(MONTH, 500);
+    const b = await store.getMonthBudget(MONTH);
+    assert.equal(b.collection, 500);
+    assert.equal(b.base, 500); // legacy views keep working
+    assert.equal(b.hasEntry, true);
+    assert.deepEqual(b.topups, []);
+    assert.deepEqual(b.lowBalanceNotified, []);
+  });
+
+  it('per-member top-ups accumulate and feed the remaining math', async () => {
+    const house = await store.createHouse({ name: 'Money Home', created_by: 'admin' });
+    await store.createUser({ username: 'v2mina', passHash: auth.hashPassword('password123'), role: 'member' });
+    const mina = await store.findUserByUsername('v2mina');
+    await store.joinHouse(mina.id, house.invite_code);
+
+    await store.addMemberTopup(MONTH, mina.id, 'Mina', 30);
+    await store.addMemberTopup(MONTH, mina.id, 'Mina', 20);
+    const b = await store.getMonthBudget(MONTH);
+    const myTopups = summary.round2(b.topups
+      .filter((t) => String(t.user_id) === String(mina.id))
+      .reduce((s, t) => s + t.amount, 0));
+    assert.equal(myTopups, 50);
+
+    const members = await store.listHouseMembers(house.id);
+    const share = summary.memberShare(b.collection, members.length);
+    assert.equal(share, 500); // only member so far
+    // Another member joins -> share recalculates live.
+    await store.createUser({ username: 'v2gita', passHash: auth.hashPassword('password123'), role: 'member' });
+    const gita = await store.findUserByUsername('v2gita');
+    await store.joinHouse(gita.id, house.invite_code);
+    const members2 = await store.listHouseMembers(house.id);
+    assert.equal(summary.memberShare(b.collection, members2.length), 250);
+    // Mina's remaining: 250 share + 50 top-ups - 0 spent.
+    assert.equal(summary.memberRemaining({ share: 250, topups: 50, spent: 0 }), 300);
+    assert.equal(summary.isLowBalance(300), false);
+  });
+
+  it('low-balance notification fires exactly once per member per month', async () => {
+    const first = await store.markLowBalanceNotified(MONTH, 'u-1');
+    const second = await store.markLowBalanceNotified(MONTH, 'u-1');
+    const other = await store.markLowBalanceNotified(MONTH, 'u-2');
+    assert.equal(first, true);
+    assert.equal(second, false); // no re-fire
+    assert.equal(other, true);
+    const b = await store.getMonthBudget(MONTH);
+    assert.deepEqual([...b.lowBalanceNotified].sort(), ['u-1', 'u-2']);
+  });
+
+  it('a member spending below $50 remaining trips the low flag', async () => {
+    // $80 collection, 2 members -> $40 share each -> already below $50.
+    await store.setMonthCollection('2027-01', 80);
+    const b = await store.getMonthBudget('2027-01');
+    assert.equal(b.collection, 80);
+    assert.equal(summary.isLowBalance(summary.memberShare(80, 2)), true);
+    assert.equal(summary.isLowBalance(summary.memberShare(500, 5)), false);
+  });
+});

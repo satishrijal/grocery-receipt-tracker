@@ -120,3 +120,17 @@ th.num, td.num { text-align: right; white-space: nowrap; }
 .mactions input { width: 150px; margin: 0; padding: 10px; font-size: 15px; }
 .pos { color: var(--green); }
 form.addmoney { margin-top: 10px; }
+
+/* ---- v2: household finance ---- */
+.lowbanner {
+  background: #fdecea; border: 2px solid var(--red, #d93025); border-radius: 12px;
+  padding: 12px 14px; margin: 12px 0;
+}
+.lowbanner strong { color: var(--red, #d93025); font-size: 18px; }
+tr.lowrow td { background: #fdecea; }
+tr.lowrow td:first-child { border-radius: 8px 0 0 8px; }
+tr.lowrow td:last-child { border-radius: 0 8px 8px 0; }
+.hrow {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  border: 1px solid #eef0f2; border-radius: 12px; padding: 10px; margin: 8px 0; flex-wrap: wrap;
+}

@@ -26,4 +26,48 @@ function newSessionId() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-module.exports = { hashPassword, verifyPassword, newSessionId };
+// ------------------------------------------------- self-signup (v2) ---
+const GMAIL_RE = /^[A-Za-z0-9._%+-]+@gmail\.com$/i;
+
+/**
+ * Validate a self-signup form. Returns an error message string, or null
+ * when everything is fine. Kept pure so it is easy to unit test.
+ */
+function validateSignup({ name, email, password, confirm }) {
+  const cleanName = String(name || '').trim();
+  if (!cleanName || cleanName.length > 40) {
+    return 'Please enter your name (up to 40 characters).';
+  }
+  const cleanEmail = String(email || '').trim().toLowerCase();
+  if (!GMAIL_RE.test(cleanEmail)) {
+    return 'Please use a valid Gmail address (…@gmail.com).';
+  }
+  if (String(password || '').length < 8) {
+    return 'Password must be at least 8 characters.';
+  }
+  if (password !== confirm) {
+    return 'The two passwords do not match.';
+  }
+  return null;
+}
+
+/** Secure random email-verification token (hex). */
+function newVerifyToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+/** Verification links live for 24 hours. */
+function verifyTokenExpiry() {
+  return new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+}
+
+/**
+ * Login gate: accounts created before email verification existed have no
+ * email_verified field and keep working. Only an explicit `false` blocks.
+ */
+function loginAllowed(member) {
+  if (!member) return false;
+  return member.email_verified !== false;
+}
+
+module.exports = { hashPassword, verifyPassword, newSessionId, validateSignup, newVerifyToken, verifyTokenExpiry, loginAllowed };

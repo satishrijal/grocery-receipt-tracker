@@ -1,39 +1,69 @@
-# 🧾 Grocery Receipt Tracker
+# 🧾 Grocery Receipt Tracker — now a household finance app (v2)
 
-Family grocery budget app. Everyone gets a login, snaps a photo of each
-grocery receipt (Walmart, India Bazaar, anywhere), the app reads the items
-off the photo, you review and fix them, and the dashboard shows this month's
-spending: total spent, money left of the **monthly budget**, spending per item
-(e.g. $50 on chicken, $50 on water) and per store.
+Family grocery budget app, upgraded: everyone **signs up themselves with
+their Gmail** (email verification required), joins a **house** with an invite
+code, and gets an equal **share of the monthly collection** (e.g. $500 ÷ 5 =
+$100 each). Snap a photo of each grocery receipt — the app reads the items,
+you review and fix them, and your dashboard shows **your** share, spending,
+and remaining. Drop **below $50** and you get a low-money alert (in the app
+plus one email per month) with an **add-money** button to top up your share.
 
 iPhone photos work as-is: **HEIC pictures are converted to JPEG automatically**
 before the app reads them.
 
 No terminal needed for any of this — everything below is done in the browser.
 
+## What's new in v2
+
+- **Self-signup with Gmail**: name + Gmail address + password (min 8 chars).
+  A verification link is emailed — **login is blocked until it's clicked**.
+  "Resend verification email" is on the login page.
+- **Houses + invite codes**: the admin creates a house (Admin → Houses) and
+  shares the short invite code. Members sign up and join with the code —
+  one house per person.
+- **Monthly collection + per-member shares**: the admin sets how much the
+  house collects each month (default $500). Each member's share = collection ÷
+  members, recalculated live when someone joins. Members see *my share / my
+  spending / my remaining*; the admin sees everyone in a per-house table.
+- **Receipts stay the same**: photo snap + AI reading + editable review, now
+  automatically attributed to whoever uploaded. Members see their own
+  item/store breakdowns; the admin sees the whole house.
+- **Low-balance alerts (< $50)**: a persistent red banner for the member
+  ("⚠️ Money is low — add more money") with an add-money button, one email
+  per member per month (no spam), and red flags on the admin's member table.
+- **Top-ups**: "Add money" now adds to *your own share* mid-month and is
+  logged in history.
+
+Old admin-created logins keep working exactly as before — nothing breaks.
+
 ## Deploy (browser only)
 
 1. **Create a GitHub repo** named `grocery-receipt-tracker` (github.com → New repository).
-2. **Upload the project files**: in the new repo click *Add file → Upload files* and
-   drag in everything from this project folder (server.js, package.json, public/,
-   all the .js files, README.md). Do NOT upload the `node_modules` folder.
-   Commit the files.
+   If the v1 repo already exists, you're just updating it — see DEPLOY_NOTES.md.
+2. **Upload the project files**: in the repo click *Add file → Upload files* and
+   drag in everything from this project folder (server.js, email.js, package.json,
+   public/, all the .js files, README.md, DEPLOY_NOTES.md). Do NOT upload the
+   `node_modules` folder. Commit the files.
 3. **Render → New Web Service**: go to dashboard.render.com → *New → Web Service* →
    connect the `grocery-receipt-tracker` repo. Set **Build Command** to
    `npm install` and **Start Command** to `npm start`. (No build step otherwise.)
 4. **Environment tab** — add these yourself, never share the values with anyone:
-   - `ADMIN_USER` — your admin username (your choice)
-   - `ADMIN_PASS` — your admin password (your choice)
-   - `DATABASE_URL` — from Neon. You already have a Neon account/project from
-     Teen Patti — in the Neon dashboard create a **second database** in the same
-     project and copy its connection string here.
+   - `ADMIN_USER` — your admin username (your choice, unchanged from v1)
+   - `ADMIN_PASS` — your admin password (your choice, unchanged from v1)
+   - `DATABASE_URL` — from Neon (unchanged from v1; skip if you never set it)
+   - `RESEND_API_KEY` — **new for v2**: from a free resend.com account
+     (100 emails/day free). Needed for verification + low-balance emails.
+     Without it the app still runs — new signups see a notice and the admin
+     verifies them by hand from the Admin page (their links are shown there).
+   - `FROM_EMAIL` — optional: the sender address for the emails. Defaults to
+     `onboarding@resend.dev` (works without a custom domain, but Resend only
+     delivers those to your own address — verify a domain in Resend to email
+     the whole family).
 5. Click **Deploy**, wait for it to go live, then open the URL.
 
-First visit: log in with your `ADMIN_USER` / `ADMIN_PASS`, open **Admin**, create
-a login for each family member. When you first open the dashboard each month,
-it asks **"How much money are you starting with this month?"** — it suggests
-last month's amount (or $500 the very first time). The admin can also change
-the current month's starting budget from the Admin panel.
+First visit: log in with your `ADMIN_USER` / `ADMIN_PASS`, open **Admin**,
+create a **house**, set the **monthly collection**, and share the invite code
+with the family. They sign up at `/signup` with their Gmail and join.
 
 ## How it works
 

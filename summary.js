@@ -87,6 +87,27 @@ function needsBudgetPrompt({ month, currentMonth, hasEntry }) {
   return String(month) === String(currentMonth) && !hasEntry;
 }
 
+// ------------------------------------------------- household finance ---
+/** A member's remaining balance triggers the low-money alert below this. */
+const LOW_BALANCE_THRESHOLD = 50;
+
+/** One member's equal share of the monthly collection (recalculated live). */
+function memberShare(collection, memberCount) {
+  const n = Number(memberCount) || 0;
+  if (n <= 0) return 0;
+  return round2((Number(collection) || 0) / n);
+}
+
+/** A member's remaining money: their share + top-ups − what they spent. */
+function memberRemaining({ share, topups, spent }) {
+  return round2((Number(share) || 0) + (Number(topups) || 0) - (Number(spent) || 0));
+}
+
+/** True when the remaining balance should trigger the low-money alert. */
+function isLowBalance(remaining) {
+  return (Number(remaining) || 0) < LOW_BALANCE_THRESHOLD;
+}
+
 module.exports = {
   round2,
   monthKeyOf,
@@ -97,4 +118,8 @@ module.exports = {
   prettyMonth,
   summarizeMonth,
   needsBudgetPrompt,
+  LOW_BALANCE_THRESHOLD,
+  memberShare,
+  memberRemaining,
+  isLowBalance,
 };

@@ -39,14 +39,15 @@ let cache = null;
 // ---------------------------------------------------------------- JSON ---
 function blankDb() {
   return {
-    users: [], // {id, username, passHash, role, created_at}
+    users: [], // {id, username, passHash, role, email, name, email_verified, verification_token, verification_expires, house_id, created_at}
+    houses: [], // {id, name, invite_code, created_by, created_at}
     receipts: [], // {id, store, date, total, uploaded_by, uploaded_by_name, photo, created_at}
     items: [], // {id, receipt_id, name, name_raw, price}
     sessions: [], // {id, user_id, username, role, created_at}
     settings: { budget: 500, budgets: {} },
-    // settings.budgets: { "2026-09": { base: 500, adjustments: [{amount, at, by}] } }
+    // settings.budgets: { "2026-09": { base, collection, adjustments: [{amount, at, by}], topups: [{user_id, username, amount, at}], lowBalanceNotified: [userId] } }
     // settings.budget is the legacy single global budget (fallback for old months).
-    seq: { user: 1, receipt: 1, item: 1 },
+    seq: { user: 1, receipt: 1, item: 1, house: 1 },
   };
 }
 
@@ -62,7 +63,22 @@ function loadCache() {
   cache.settings = cache.settings || { budget: 500, budgets: {} };
   cache.settings.budgets = cache.settings.budgets || {};
   cache.seq = cache.seq || { user: 1, receipt: 1, item: 1 };
-  for (const k of ['users', 'receipts', 'items', 'sessions']) cache[k] = cache[k] || [];
+  if (cache.seq.house == null) cache.seq.house = 1;
+  for (const k of ['users', 'houses', 'receipts', 'items', 'sessions']) cache[k] = cache[k] || [];
+  // Migration-tolerant: fill in v2 fields on old records.
+  for (const u of cache.users) {
+    if (u.email === undefined) u.email = null;
+    if (u.name === undefined) u.name = null;
+    if (u.verification_token === undefined) u.verification_token = null;
+    if (u.verification_expires === undefined) u.verification_expires = null;
+    if (u.house_id === undefined) u.house_id = null;
+    // NOTE: email_verified is intentionally left alone — old accounts
+    // (no email) have it undefined and must keep logging in.
+  }
+  for (const e of Object.values(cache.settings.budgets)) {
+    if (!Array.isArray(e.topups)) e.topups = [];
+    if (!Array.isArray(e.lowBalanceNotified)) e.lowBalanceNotified = [];
+  }
   return cache;
 }
 
@@ -85,22 +101,29 @@ const jsonBackend = {
     saveCache();
   },
   /**
-   * Per-month budget: { base, added, total, adjustments, hasEntry }.
+   * Per-month budget: { base, added, total, adjustments, hasEntry,
+   *   collection, topups, lowBalanceNotified }.
    * hasEntry is false when the month was never given a starting budget —
    * the dashboard then asks instead of silently using a default.
    * Old months without an entry fall back to the legacy global budget.
+   * collection is the house's monthly collection (v2); it falls back to
+   * base, then the legacy budget, then 500.
    */
   async getMonthBudget(month) {
     const db = loadCache();
     const e = db.settings.budgets[String(month)];
+    const legacy = Number(db.settings.budget) || 0;
     if (!e) {
-      const legacy = Number(db.settings.budget) || 0;
-      return { base: legacy, added: 0, total: legacy, adjustments: [], hasEntry: false };
+      const collection = legacy > 0 ? legacy : 500;
+      return { base: legacy, added: 0, total: legacy, adjustments: [], hasEntry: false, collection, topups: [], lowBalanceNotified: [] };
     }
     const adjustments = Array.isArray(e.adjustments) ? e.adjustments : [];
     const added = summary.round2(adjustments.reduce((s, a) => s + (Number(a.amount) || 0), 0));
     const base = Number(e.base) || 0;
-    return { base, added, total: summary.round2(base + added), adjustments, hasEntry: true };
+    const collection = e.collection != null ? Number(e.collection) : (base || legacy || 500);
+    const topups = Array.isArray(e.topups) ? e.topups : [];
+    const lowBalanceNotified = Array.isArray(e.lowBalanceNotified) ? e.lowBalanceNotified : [];
+    return { base, added, total: summary.round2(base + added), adjustments, hasEntry: true, collection, topups, lowBalanceNotified };
   },
   /** Set (or create) the month's starting budget. Never touches adjustments. */
   async setMonthBudgetBase(month, amount) {
@@ -122,6 +145,51 @@ const jsonBackend = {
     db.settings.budgets[key] = e;
     saveCache();
   },
+  /**
+   * Set the house's monthly collection (v2). base is kept in sync so the
+   * legacy budget views keep working unchanged.
+   */
+  async setMonthCollection(month, amount) {
+    const db = loadCache();
+    const key = String(month);
+    const e = db.settings.budgets[key] || { base: 0, adjustments: [] };
+    e.base = summary.round2(amount);
+    e.collection = summary.round2(amount);
+    if (!Array.isArray(e.adjustments)) e.adjustments = [];
+    if (!Array.isArray(e.topups)) e.topups = [];
+    if (!Array.isArray(e.lowBalanceNotified)) e.lowBalanceNotified = [];
+    db.settings.budgets[key] = e;
+    saveCache();
+  },
+  /** A member tops up their own share mid-month; logged as its own entry. */
+  async addMemberTopup(month, userId, username, amount) {
+    const db = loadCache();
+    const key = String(month);
+    const e = db.settings.budgets[key] || { base: 0, adjustments: [] };
+    if (!Array.isArray(e.topups)) e.topups = [];
+    e.topups.push({
+      user_id: String(userId), username: String(username || ''),
+      amount: summary.round2(amount), at: new Date().toISOString(),
+    });
+    db.settings.budgets[key] = e;
+    saveCache();
+  },
+  /**
+   * Record that a member got their low-balance email this month.
+   * Returns true when this is the first time (so the mail fires once).
+   */
+  async markLowBalanceNotified(month, userId) {
+    const db = loadCache();
+    const key = String(month);
+    const e = db.settings.budgets[key] || { base: 0, adjustments: [] };
+    if (!Array.isArray(e.lowBalanceNotified)) e.lowBalanceNotified = [];
+    const id = String(userId);
+    if (e.lowBalanceNotified.map(String).includes(id)) return false;
+    e.lowBalanceNotified.push(id);
+    db.settings.budgets[key] = e;
+    saveCache();
+    return true;
+  },
   /** Prefill for the "starting budget?" prompt: last month's base, else legacy, else 500. */
   async getBudgetPrefill(month) {
     const db = loadCache();
@@ -130,12 +198,25 @@ const jsonBackend = {
     const legacy = Number(db.settings.budget);
     return legacy > 0 ? legacy : 500;
   },
-  async createUser({ username, passHash, role }) {
+  async createUser({ username, passHash, role, email, name, emailVerified, verificationToken, verificationExpires }) {
     const db = loadCache();
     if (db.users.some((u) => u.username.toLowerCase() === username.toLowerCase())) {
       throw new Error('username-taken');
     }
-    const user = { id: nextId('user'), username, passHash, role: role || 'member', created_at: new Date().toISOString() };
+    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
+    if (cleanEmail && db.users.some((u) => u.email && u.email.toLowerCase() === cleanEmail)) {
+      throw new Error('email-taken');
+    }
+    const user = {
+      id: nextId('user'), username, passHash, role: role || 'member',
+      email: cleanEmail, name: name ? String(name).trim().slice(0, 40) : null,
+      // email_verified stays undefined for old-style accounts so they keep logging in.
+      email_verified: emailVerified === undefined ? undefined : !!emailVerified,
+      verification_token: verificationToken || null,
+      verification_expires: verificationExpires || null,
+      house_id: null,
+      created_at: new Date().toISOString(),
+    };
     db.users.push(user);
     saveCache();
     return { id: user.id, username: user.username, role: user.role };
@@ -143,8 +224,113 @@ const jsonBackend = {
   async findUserByUsername(username) {
     return loadCache().users.find((u) => u.username.toLowerCase() === String(username).toLowerCase()) || null;
   },
+  async getUserById(id) {
+    return loadCache().users.find((u) => u.id === String(id)) || null;
+  },
+  async findUserByEmail(email) {
+    const clean = String(email || '').trim().toLowerCase();
+    return loadCache().users.find((u) => u.email && u.email.toLowerCase() === clean) || null;
+  },
+  /** Finds by token only while it hasn't expired; expired tokens return null. */
+  async findUserByVerificationToken(token) {
+    if (!token) return null;
+    const u = loadCache().users.find((x) => x.verification_token === String(token));
+    if (!u) return null;
+    if (!u.verification_expires || new Date(u.verification_expires).getTime() <= Date.now()) return null;
+    return u;
+  },
+  async setVerificationToken(id, token, expires) {
+    const u = loadCache().users.find((x) => x.id === String(id));
+    if (!u) throw new Error('not-found');
+    u.verification_token = token;
+    u.verification_expires = expires;
+    saveCache();
+  },
+  async verifyUser(id) {
+    const u = loadCache().users.find((x) => x.id === String(id));
+    if (!u) throw new Error('not-found');
+    u.email_verified = true;
+    u.verification_token = null;
+    u.verification_expires = null;
+    saveCache();
+  },
+  async setUserHouse(id, houseId) {
+    const u = loadCache().users.find((x) => x.id === String(id));
+    if (!u) throw new Error('not-found');
+    u.house_id = houseId ? String(houseId) : null;
+    saveCache();
+  },
+  // ------------------------------------------------------------- houses ---
+  /** Short, unambiguous invite codes (no 0/O, 1/I/L lookalikes). */
+  _newInviteCode(db) {
+    const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    let code;
+    do {
+      code = Array.from({ length: 6 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+    } while (db.houses.some((h) => h.invite_code === code));
+    return code;
+  },
+  async createHouse({ name, created_by }) {
+    const db = loadCache();
+    const clean = String(name || '').trim().slice(0, 60);
+    if (!clean) throw new Error('name-required');
+    const house = {
+      id: 'h' + nextId('house'),
+      name: clean,
+      invite_code: jsonBackend._newInviteCode(db),
+      created_by: created_by ? String(created_by) : null,
+      created_at: new Date().toISOString(),
+    };
+    db.houses.push(house);
+    saveCache();
+    return { ...house };
+  },
+  async listHouses() {
+    return loadCache().houses.map((h) => ({ ...h }));
+  },
+  async getHouse(id) {
+    return loadCache().houses.find((h) => h.id === String(id)) || null;
+  },
+  async deleteHouse(id) {
+    const db = loadCache();
+    const hid = String(id);
+    db.houses = db.houses.filter((h) => h.id !== hid);
+    for (const u of db.users) if (u.house_id === hid) u.house_id = null;
+    saveCache();
+  },
+  async joinHouse(userId, code) {
+    const db = loadCache();
+    const clean = String(code || '').trim().toUpperCase();
+    const house = db.houses.find((h) => h.invite_code === clean);
+    if (!house) throw new Error('bad-code');
+    const u = db.users.find((x) => x.id === String(userId));
+    if (!u) throw new Error('not-found');
+    u.house_id = house.id;
+    saveCache();
+    return { ...house };
+  },
+  async leaveHouse(userId) {
+    const u = loadCache().users.find((x) => x.id === String(userId));
+    if (!u) throw new Error('not-found');
+    u.house_id = null;
+    saveCache();
+  },
+  async listHouseMembers(houseId) {
+    return loadCache()
+      .users.filter((u) => u.house_id === String(houseId))
+      .sort((a, b) => String(a.username).localeCompare(String(b.username)))
+      .map((u) => ({
+        id: u.id, username: u.username, name: u.name, email: u.email,
+        role: u.role, email_verified: u.email_verified, house_id: u.house_id,
+        created_at: u.created_at,
+      }));
+  },
   async listUsers() {
-    return loadCache().users.map((u) => ({ id: u.id, username: u.username, role: u.role, created_at: u.created_at }));
+    return loadCache().users.map((u) => ({
+      id: u.id, username: u.username, role: u.role, created_at: u.created_at,
+      email: u.email || null, name: u.name || null,
+      email_verified: u.email_verified, house_id: u.house_id || null,
+    }));
   },
   async setUserPassword(id, passHash) {
     const u = loadCache().users.find((x) => x.id === String(id));
@@ -234,6 +420,20 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (LOWER(username));
+-- v2 columns (idempotent so old databases upgrade in place)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_expires TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS house_id TEXT;
+CREATE TABLE IF NOT EXISTS houses (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  invite_code TEXT NOT NULL UNIQUE,
+  created_by TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS receipts (
   id SERIAL PRIMARY KEY,
   store TEXT NOT NULL,
@@ -267,10 +467,22 @@ CREATE TABLE IF NOT EXISTS budgets (
   base NUMERIC NOT NULL DEFAULT 0, -- starting budget for the month
   adjustments JSONB NOT NULL DEFAULT '[]' -- [{amount, at, by}] added mid-month
 );
+-- v2 columns (idempotent so old databases upgrade in place)
+ALTER TABLE budgets ADD COLUMN IF NOT EXISTS collection NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE budgets ADD COLUMN IF NOT EXISTS topups JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE budgets ADD COLUMN IF NOT EXISTS low_balance_notified JSONB NOT NULL DEFAULT '[]';
 `;
 
 const q = (text, params) => pool.query(text, params);
-const mapUser = (r) => ({ id: String(r.id), username: r.username, role: r.role });
+const mapUser = (r) => ({
+  id: String(r.id), username: r.username, role: r.role,
+  email: r.email || null, name: r.name || null,
+  email_verified: r.email_verified === undefined ? undefined : r.email_verified,
+  verification_token: r.verification_token || null,
+  verification_expires: r.verification_expires || null,
+  house_id: r.house_id || null,
+  created_at: r.created_at,
+});
 
 const pgBackend = {
   async getBudget() {
@@ -281,15 +493,19 @@ const pgBackend = {
     await q("INSERT INTO settings(key,value) VALUES('budget',$1) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", [String(n)]);
   },
   async getMonthBudget(month) {
-    const r = await q('SELECT base, adjustments FROM budgets WHERE month=$1', [String(month)]);
+    const r = await q('SELECT base, collection, adjustments, topups, low_balance_notified FROM budgets WHERE month=$1', [String(month)]);
+    const legacy = await pgBackend.getBudget();
     if (!r.rows.length) {
-      const legacy = await pgBackend.getBudget();
-      return { base: legacy, added: 0, total: legacy, adjustments: [], hasEntry: false };
+      const collection = legacy > 0 ? legacy : 500;
+      return { base: legacy, added: 0, total: legacy, adjustments: [], hasEntry: false, collection, topups: [], lowBalanceNotified: [] };
     }
     const adjustments = Array.isArray(r.rows[0].adjustments) ? r.rows[0].adjustments : [];
     const added = summary.round2(adjustments.reduce((s, a) => s + (Number(a.amount) || 0), 0));
     const base = Number(r.rows[0].base) || 0;
-    return { base, added, total: summary.round2(base + added), adjustments, hasEntry: true };
+    const collection = r.rows[0].collection != null ? Number(r.rows[0].collection) : (base || legacy || 500);
+    const topups = Array.isArray(r.rows[0].topups) ? r.rows[0].topups : [];
+    const lowBalanceNotified = Array.isArray(r.rows[0].low_balance_notified) ? r.rows[0].low_balance_notified : [];
+    return { base, added, total: summary.round2(base + added), adjustments, hasEntry: true, collection, topups, lowBalanceNotified };
   },
   async setMonthBudgetBase(month, amount) {
     const n = summary.round2(amount);
@@ -310,29 +526,98 @@ const pgBackend = {
       await q('UPDATE budgets SET adjustments=$1::jsonb WHERE month=$2', [JSON.stringify(arr), String(month)]);
     }
   },
+  async setMonthCollection(month, amount) {
+    const n = summary.round2(amount);
+    await q(
+      "INSERT INTO budgets(month, base, collection, adjustments) VALUES($1,$2,$2,'[]') " +
+      'ON CONFLICT(month) DO UPDATE SET base=EXCLUDED.base, collection=EXCLUDED.collection',
+      [String(month), n]
+    );
+  },
+  async addMemberTopup(month, userId, username, amount) {
+    const entry = { user_id: String(userId), username: String(username || ''), amount: summary.round2(amount), at: new Date().toISOString() };
+    const cur = await q('SELECT topups FROM budgets WHERE month=$1', [String(month)]);
+    if (!cur.rows.length) {
+      await q('INSERT INTO budgets(month, base, topups) VALUES($1, 0, $2::jsonb)', [String(month), JSON.stringify([entry])]);
+    } else {
+      const arr = Array.isArray(cur.rows[0].topups) ? cur.rows[0].topups : [];
+      arr.push(entry);
+      await q('UPDATE budgets SET topups=$1::jsonb WHERE month=$2', [JSON.stringify(arr), String(month)]);
+    }
+  },
+  async markLowBalanceNotified(month, userId) {
+    const cur = await q('SELECT low_balance_notified FROM budgets WHERE month=$1', [String(month)]);
+    if (!cur.rows.length) {
+      await q('INSERT INTO budgets(month, base, low_balance_notified) VALUES($1, 0, $2::jsonb)', [String(month), JSON.stringify([String(userId)])]);
+      return true;
+    }
+    const arr = Array.isArray(cur.rows[0].low_balance_notified) ? cur.rows[0].low_balance_notified : [];
+    if (arr.map(String).includes(String(userId))) return false;
+    arr.push(String(userId));
+    await q('UPDATE budgets SET low_balance_notified=$1::jsonb WHERE month=$2', [JSON.stringify(arr), String(month)]);
+    return true;
+  },
   async getBudgetPrefill(month) {
     const prev = await q('SELECT base FROM budgets WHERE month=$1', [summary.prevMonth(String(month))]);
     if (prev.rows.length) return Number(prev.rows[0].base) || 0;
     const legacy = await pgBackend.getBudget();
     return legacy > 0 ? legacy : 500;
   },
-  async createUser({ username, passHash, role }) {
+  async createUser({ username, passHash, role, email, name, emailVerified, verificationToken, verificationExpires }) {
+    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
     try {
-      const r = await q('INSERT INTO users(username, pass_hash, role) VALUES($1,$2,$3) RETURNING id, username, role', [username, passHash, role || 'member']);
-      return mapUser(r.rows[0]);
+      const r = await q(
+        'INSERT INTO users(username, pass_hash, role, email, name, email_verified, verification_token, verification_expires) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, username, role',
+        [username, passHash, role || 'member', cleanEmail, name ? String(name).trim().slice(0, 40) : null,
+          emailVerified === undefined ? null : !!emailVerified, verificationToken || null,
+          verificationExpires ? new Date(verificationExpires) : null]
+      );
+      return { id: String(r.rows[0].id), username: r.rows[0].username, role: r.rows[0].role };
     } catch (e) {
-      if (e.code === '23505') throw new Error('username-taken');
+      if (e.code === '23505') {
+        // Could be username or email uniqueness — report generically; the
+        // server checks each field first for a precise message.
+        throw new Error('username-taken');
+      }
       throw e;
     }
   },
   async findUserByUsername(username) {
-    const r = await q('SELECT id, username, pass_hash AS "passHash", role FROM users WHERE LOWER(username)=LOWER($1)', [username]);
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, house_id, created_at FROM users WHERE LOWER(username)=LOWER($1)', [username]);
     if (!r.rows.length) return null;
     const u = r.rows[0];
-    return { id: String(u.id), username: u.username, passHash: u.passHash, role: u.role };
+    return { ...mapUser(u), passHash: u.passHash };
+  },
+  async getUserById(id) {
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, house_id, created_at FROM users WHERE id=$1', [Number(id)]);
+    if (!r.rows.length) return null;
+    const u = r.rows[0];
+    return { ...mapUser(u), passHash: u.passHash };
+  },
+  async findUserByEmail(email) {
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, house_id, created_at FROM users WHERE LOWER(email)=LOWER($1)', [String(email || '').trim().toLowerCase()]);
+    if (!r.rows.length) return null;
+    const u = r.rows[0];
+    return { ...mapUser(u), passHash: u.passHash };
+  },
+  async findUserByVerificationToken(token) {
+    if (!token) return null;
+    const r = await q('SELECT id, username, pass_hash AS "passHash", role, email, name, email_verified, verification_token, verification_expires, house_id, created_at FROM users WHERE verification_token=$1 AND verification_expires > now()', [String(token)]);
+    if (!r.rows.length) return null;
+    const u = r.rows[0];
+    return { ...mapUser(u), passHash: u.passHash };
+  },
+  async setVerificationToken(id, token, expires) {
+    await q('UPDATE users SET verification_token=$1, verification_expires=$2 WHERE id=$3', [token, expires ? new Date(expires) : null, Number(id)]);
+  },
+  async verifyUser(id) {
+    await q('UPDATE users SET email_verified=TRUE, verification_token=NULL, verification_expires=NULL WHERE id=$1', [Number(id)]);
+  },
+  async setUserHouse(id, houseId) {
+    await q('UPDATE users SET house_id=$1 WHERE id=$2', [houseId ? String(houseId) : null, Number(id)]);
   },
   async listUsers() {
-    const r = await q('SELECT id, username, role, created_at FROM users ORDER BY username');
+    const r = await q('SELECT id, username, role, email, name, email_verified, house_id, created_at FROM users ORDER BY username');
     return r.rows.map(mapUser);
   },
   async setUserPassword(id, passHash) {
@@ -341,6 +626,51 @@ const pgBackend = {
   },
   async deleteUser(id) {
     await q('DELETE FROM users WHERE id=$1', [Number(id)]);
+  },
+  // ------------------------------------------------------------- houses ---
+  async _newInviteCode() {
+    const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    for (let tries = 0; tries < 50; tries++) {
+      const code = Array.from({ length: 6 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+      const r = await q('SELECT 1 FROM houses WHERE invite_code=$1', [code]);
+      if (!r.rows.length) return code;
+    }
+    throw new Error('code-generation-failed');
+  },
+  async createHouse({ name, created_by }) {
+    const clean = String(name || '').trim().slice(0, 60);
+    if (!clean) throw new Error('name-required');
+    const id = 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const code = await pgBackend._newInviteCode();
+    const r = await q('INSERT INTO houses(id, name, invite_code, created_by) VALUES($1,$2,$3,$4) RETURNING *', [id, clean, code, created_by ? String(created_by) : null]);
+    return houseRow(r.rows[0]);
+  },
+  async listHouses() {
+    const r = await q('SELECT * FROM houses ORDER BY created_at');
+    return r.rows.map(houseRow);
+  },
+  async getHouse(id) {
+    const r = await q('SELECT * FROM houses WHERE id=$1', [String(id)]);
+    return r.rows.length ? houseRow(r.rows[0]) : null;
+  },
+  async deleteHouse(id) {
+    const hid = String(id);
+    await q('UPDATE users SET house_id=NULL WHERE house_id=$1', [hid]);
+    await q('DELETE FROM houses WHERE id=$1', [hid]);
+  },
+  async joinHouse(userId, code) {
+    const clean = String(code || '').trim().toUpperCase();
+    const r = await q('SELECT * FROM houses WHERE invite_code=$1', [clean]);
+    if (!r.rows.length) throw new Error('bad-code');
+    await q('UPDATE users SET house_id=$1 WHERE id=$2', [r.rows[0].id, Number(userId)]);
+    return houseRow(r.rows[0]);
+  },
+  async leaveHouse(userId) {
+    await q('UPDATE users SET house_id=NULL WHERE id=$1', [Number(userId)]);
+  },
+  async listHouseMembers(houseId) {
+    const r = await q('SELECT id, username, role, email, name, email_verified, house_id, created_at FROM users WHERE house_id=$1 ORDER BY username', [String(houseId)]);
+    return r.rows.map(mapUser);
   },
   async createReceipt({ store, date, total, uploaded_by, uploaded_by_name, photo }) {
     const r = await q(
@@ -401,6 +731,13 @@ function rowToReceipt(r) {
   };
 }
 
+function houseRow(r) {
+  return {
+    id: String(r.id), name: r.name, invite_code: r.invite_code,
+    created_by: r.created_by, created_at: r.created_at,
+  };
+}
+
 async function pgIsEmpty() {
   const u = await q('SELECT COUNT(*)::int AS c FROM users');
   const r = await q('SELECT COUNT(*)::int AS c FROM receipts');
@@ -427,8 +764,21 @@ async function maybeMigrate() {
   console.log('[store] One-time migration: JSON -> PostgreSQL...');
   const userMap = {};
   for (const u of data.users || []) {
-    const r = await q('INSERT INTO users(username, pass_hash, role) VALUES($1,$2,$3) RETURNING id', [u.username, u.passHash, u.role || 'member']);
+    const r = await q(
+      'INSERT INTO users(username, pass_hash, role, email, name, email_verified, verification_token, verification_expires, house_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id',
+      [u.username, u.passHash, u.role || 'member', u.email || null, u.name || null,
+        u.email_verified === undefined ? null : !!u.email_verified,
+        u.verification_token || null,
+        u.verification_expires ? new Date(u.verification_expires) : null,
+        u.house_id || null]
+    );
     userMap[String(u.id)] = r.rows[0].id;
+  }
+  for (const h of data.houses || []) {
+    await q(
+      'INSERT INTO houses(id, name, invite_code, created_by) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO NOTHING',
+      [String(h.id), h.name, h.invite_code, h.created_by ? (userMap[String(h.created_by)] ? String(userMap[String(h.created_by)]) : h.created_by) : null]
+    );
   }
   for (const rc of data.receipts || []) {
     const r = await q(
@@ -443,8 +793,12 @@ async function maybeMigrate() {
   if (data.settings && data.settings.budget != null) await pgBackend.setBudget(Number(data.settings.budget));
   for (const [month, e] of Object.entries((data.settings && data.settings.budgets) || {})) {
     await q(
-      'INSERT INTO budgets(month, base, adjustments) VALUES($1,$2,$3::jsonb) ON CONFLICT(month) DO NOTHING',
-      [month, Number(e.base) || 0, JSON.stringify(Array.isArray(e.adjustments) ? e.adjustments : [])]
+      'INSERT INTO budgets(month, base, collection, adjustments, topups, low_balance_notified) VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb) ON CONFLICT(month) DO NOTHING',
+      [month, Number(e.base) || 0,
+        e.collection != null ? Number(e.collection) : (Number(e.base) || 0),
+        JSON.stringify(Array.isArray(e.adjustments) ? e.adjustments : []),
+        JSON.stringify(Array.isArray(e.topups) ? e.topups : []),
+        JSON.stringify(Array.isArray(e.lowBalanceNotified) ? e.lowBalanceNotified : [])]
     );
   }
   fs.renameSync(jp, MIGRATED_PATH());
@@ -492,10 +846,26 @@ module.exports = {
   setBudget: (...a) => use().setBudget(...a),
   getMonthBudget: (...a) => use().getMonthBudget(...a),
   setMonthBudgetBase: (...a) => use().setMonthBudgetBase(...a),
+  setMonthCollection: (...a) => use().setMonthCollection(...a),
   addMonthFunds: (...a) => use().addMonthFunds(...a),
+  addMemberTopup: (...a) => use().addMemberTopup(...a),
+  markLowBalanceNotified: (...a) => use().markLowBalanceNotified(...a),
   getBudgetPrefill: (...a) => use().getBudgetPrefill(...a),
   createUser: (...a) => use().createUser(...a),
   findUserByUsername: (...a) => use().findUserByUsername(...a),
+  getUserById: (...a) => use().getUserById(...a),
+  findUserByEmail: (...a) => use().findUserByEmail(...a),
+  findUserByVerificationToken: (...a) => use().findUserByVerificationToken(...a),
+  setVerificationToken: (...a) => use().setVerificationToken(...a),
+  verifyUser: (...a) => use().verifyUser(...a),
+  setUserHouse: (...a) => use().setUserHouse(...a),
+  createHouse: (...a) => use().createHouse(...a),
+  listHouses: (...a) => use().listHouses(...a),
+  getHouse: (...a) => use().getHouse(...a),
+  deleteHouse: (...a) => use().deleteHouse(...a),
+  joinHouse: (...a) => use().joinHouse(...a),
+  leaveHouse: (...a) => use().leaveHouse(...a),
+  listHouseMembers: (...a) => use().listHouseMembers(...a),
   listUsers: (...a) => use().listUsers(...a),
   setUserPassword: (...a) => use().setUserPassword(...a),
   deleteUser: (...a) => use().deleteUser(...a),
